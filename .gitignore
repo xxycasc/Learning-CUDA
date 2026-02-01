@@ -1,0 +1,16 @@
+# 忽略编译中间文件
+*.o
+*.obj
+
+# 忽略可执行文件 (Linux/Windows)
+test_kernels
+*.exe
+*.out
+
+# 忽略日志和安装包
+*.log
+*.deb
+*.run
+
+# 忽略 VS Code 配置
+.vscode/

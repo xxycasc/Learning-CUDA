@@ -20,6 +20,7 @@
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   // TODO: Implement the trace function
+  
   return T(-1);
 }
 
@@ -45,6 +46,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     int batch_size, int target_seq_len, int src_seq_len, 
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {       
   // TODO: Implement the flash attention function
+
 }
 
 // *********************************************************************
