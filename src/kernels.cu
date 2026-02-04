@@ -89,12 +89,15 @@ __global__ void flashAttention_kernel(const T* q,
     int kv_heads,
     int head_dim,
     bool is_causal){
+      
+      // 准备变量
       int batch_idx = blockIdx.z;
       int head_idx  = blockIdx.y;
       int query_idx = blockIdx.x * blockDim.x + threadIdx.x;
       int tid = threadIdx.x;
       int kv_head_idx = head_idx / (query_heads / kv_heads);
-     
+      
+      // 越界就return
       if(query_idx >= target_seq_len) return;
 
       size_t q_offset = ((size_t)batch_idx * target_seq_len * query_heads +
@@ -105,13 +108,22 @@ __global__ void flashAttention_kernel(const T* q,
       float arr[128];
       for(int i = 0; i < head_dim; ++i)
         arr[i] = 0.0f;
+
+       
       for(int i = 0; i < src_seq_len;++ i){
+
+        // 特判跳过条件
         if(is_causal && i > query_idx)continue;
+
         size_t kv_offset = ((size_t)batch_idx * src_seq_len * kv_heads +
                             (size_t)i * kv_heads + kv_head_idx) * head_dim;
         float now_sum = 0.0f;
+        
+        // online softmax 优化朴素softmax算法，核心是将softmax的多个流程优化为一个流程，边计算边更改
+
+        // 维护 online softmax 所需变量
         for(int j = 0; j < head_dim; ++j)
-          now_sum += (float)q[q_offset + j] * (float)k[kv_offset + j];
+          now_sum = (float)q[q_offset + j] * (float)k[kv_offset + j];// 需要
         now_sum *= scale;
 
         float Max_pre = Max;
@@ -120,12 +132,16 @@ __global__ void flashAttention_kernel(const T* q,
         float add = expf(now_sum - Max);
         float change = expf(Max_pre - Max);
 
+        // 公式1：sum_new = sum_old * change + add
         sum = sum * change + add;
 
+        // 公式2: O_new = O_old * change + V_curr * add
         for(int j = 0; j < head_dim; ++ j){
           arr[j] = arr[j] * change + (float)v[kv_offset + j] * add;
         }
       }
+
+      // 将结果写回o数组
       T* o_ptr = o + q_offset;
       for(int i = 0; i < head_dim; ++ i){
         o_ptr[i] = (T)(arr[i]/sum);
