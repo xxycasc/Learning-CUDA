@@ -19,11 +19,11 @@
  */
 template <typename T>
 __global__ void trace_kernel(const T* input, T* output, size_t rows, size_t cols){
-  T Max = min(rows, cols); // 计算下算几个对角线的数
-  T idx = blockIdx.x * blockDim.x + threadIdx.x;// 计算下这是第几个线程
-  T jump_number = blockDim.x * gridDim.x;// 一个线程每次循环跳的数，便于后面内存合并优化
+  size_t Max = min(rows, cols); // 计算下算几个对角线的数
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;// 计算下这是第几个线程
+  size_t jump_number = blockDim.x * gridDim.x;// 一个线程每次循环跳的数，便于后面内存合并优化
 
-  double sum = 0.0;
+  T sum = 0.0;
   for(size_t i = idx; i < Max; i += jump_number)
     sum += input[i * cols + i];//加对角线上的数
 
@@ -78,9 +78,9 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
  * @param[in] is_causal Whether to apply causal masking
  */
 template <typename T>
-__global__ void flashAttention_kernel(const T* q,      
-    const T* k,      
-    const T* v,      
+__global__ void flashAttention_kernel(const T* h_q,      
+    const T* h_k,      
+    const T* h_v,      
     T* o,            
     int batch_size,  
     int target_seq_len,
@@ -96,55 +96,95 @@ __global__ void flashAttention_kernel(const T* q,
       int query_idx = blockIdx.x * blockDim.x + threadIdx.x;
       int tid = threadIdx.x;
       int kv_head_idx = head_idx / (query_heads / kv_heads);
-      
-      // 越界就return
-      if(query_idx >= target_seq_len) return;
-
       size_t q_offset = ((size_t)batch_idx * target_seq_len * query_heads +
                        (size_t)query_idx * query_heads + head_idx) * head_dim;
-     
       float scale = 1.0f/sqrtf((float)head_dim);
       float sum = 0.0f, Max = -1e38f;
-      float arr[128];
-      for(int i = 0; i < head_dim; ++i)
-        arr[i] = 0.0f;
+      float arr[256];
+      for(int t = 0; t < head_dim; ++t)
+        arr[t] = 0.0f;
+      
+      bool valid_q = (query_idx < target_seq_len);// 先前的越界逻辑
 
-       
-      for(int i = 0; i < src_seq_len;++ i){
-
-        // 特判跳过条件
-        if(is_causal && i > query_idx)continue;
-
-        size_t kv_offset = ((size_t)batch_idx * src_seq_len * kv_heads +
-                            (size_t)i * kv_heads + kv_head_idx) * head_dim;
-        float now_sum = 0.0f;
-        
-        // online softmax 优化朴素softmax算法，核心是将softmax的多个流程优化为一个流程，边计算边更改
-
-        // 维护 online softmax 所需变量
-        for(int j = 0; j < head_dim; ++j)
-          now_sum = (float)q[q_offset + j] * (float)k[kv_offset + j];// 需要
-        now_sum *= scale;
-
-        float Max_pre = Max;
-        Max = fmaxf(Max_pre, now_sum);
-     
-        float add = expf(now_sum - Max);
-        float change = expf(Max_pre - Max);
-
-        // 公式1：sum_new = sum_old * change + add
-        sum = sum * change + add;
-
-        // 公式2: O_new = O_old * change + V_curr * add
-        for(int j = 0; j < head_dim; ++ j){
-          arr[j] = arr[j] * change + (float)v[kv_offset + j] * add;
+      // 引入共享内存和分块优化
+      
+      // 搬运数据
+      float q[256];
+      if (valid_q) {
+        for(int i =0; i < head_dim; ++ i){
+          q[i] = (float) h_q[q_offset + i];
         }
       }
+      const int tile_count = 16;
+      __shared__ float k[tile_count][260];
+      __shared__ float v[tile_count][260];
 
-      // 将结果写回o数组
-      T* o_ptr = o + q_offset;
-      for(int i = 0; i < head_dim; ++ i){
-        o_ptr[i] = (T)(arr[i]/sum);
+      for(int i = 0; i < src_seq_len; i += tile_count){
+        for(int j = tid; j < tile_count * head_dim; j += blockDim.x){
+          int row = j / head_dim;
+          int col = j % head_dim;
+          int kv_idx = i + row;
+          
+          size_t kv_base = ((size_t)batch_idx * src_seq_len * kv_heads + 
+                                  (size_t)kv_idx * kv_heads + kv_head_idx) * head_dim;
+          
+          if(kv_idx < src_seq_len){
+            k[row][col] = (float)h_k[kv_base + col];
+            v[row][col] = (float)h_v[kv_base + col];
+          }
+          // 内存开多了就初始化为0
+          else{
+            k[row][col] = 0.0f;
+            v[row][col] = 0.0f;
+          }
+        }
+        
+        // 等所有人搬完数据再继续
+        __syncthreads();
+
+        if (valid_q) {
+          for(int t = 0; t < tile_count;++ t){
+
+            // 特判跳过条件
+            int current_idx = i + t;
+            if(current_idx >= src_seq_len)break;
+            if(is_causal && current_idx > query_idx)continue;
+
+            float now_sum = 0.0f;
+
+            // online softmax 优化朴素softmax算法，核心是将softmax的多个流程优化为一个流程，边计算边更改
+
+            // 维护 online softmax 所需变量
+            for(int d = 0; d < head_dim; ++d)
+              now_sum += (float)q[d] * (float)k[t][d];
+            now_sum *= scale;
+
+            float Max_pre = Max;
+            Max = fmaxf(Max_pre, now_sum);
+
+            float add = expf(now_sum - Max);
+            float change = expf(Max_pre - Max);
+
+            // 公式1：sum_new = sum_old * change + add
+            sum = sum * change + add;
+
+            // 公式2: O_new = O_old * change + V_curr * add
+            for(int d = 0; d < head_dim; ++ d){
+              arr[d] = arr[d] * change + v[t][d] * add;
+            }
+          }
+          }
+          __syncthreads();
+      }
+      if (valid_q) {
+        // 防止除以 0
+        if (sum == 0.0f) sum = 1.0f;
+
+        // 将结果写回o数组  
+        T* o_ptr = o + q_offset;
+        for(int i = 0; i < head_dim; ++ i){
+          o_ptr[i] = (T)(arr[i]/sum);
+        }
       }
 }
 template <typename T>
