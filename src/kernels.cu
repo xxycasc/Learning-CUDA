@@ -101,6 +101,7 @@ __global__ void flashAttention_kernel(const T* h_q,
       float scale = 1.0f/sqrtf((float)head_dim);
       float sum = 0.0f, Max = -1e38f;
       float arr[256];
+      #pragma unroll
       for(int t = 0; t < head_dim; ++t)
         arr[t] = 0.0f;
       
@@ -111,6 +112,7 @@ __global__ void flashAttention_kernel(const T* h_q,
       // 搬运数据
       float q[256];
       if (valid_q) {
+        #pragma unroll
         for(int i =0; i < head_dim; ++ i){
           q[i] = (float) h_q[q_offset + i];
         }
@@ -130,6 +132,7 @@ __global__ void flashAttention_kernel(const T* h_q,
           int vec_dim = head_dim / 4;
           
           //其余逻辑与后面差不多，就是引入了向量化
+          #pragma unroll// blockDim固定，可以展开
           for(int j = tid; j < tile_count * vec_dim; j += blockDim.x){
             int row = j / vec_dim;
             int col = j % vec_dim;
@@ -170,6 +173,7 @@ __global__ void flashAttention_kernel(const T* h_q,
           }
         }
         else{
+          #pragma unroll 
           for(int j = tid; j < tile_count * head_dim; j += blockDim.x){
             int row = j / head_dim;
             int col = j % head_dim;
@@ -194,6 +198,7 @@ __global__ void flashAttention_kernel(const T* h_q,
         __syncthreads();
 
         if (valid_q) {
+          #pragma unroll 
           for(int t = 0; t < tile_count;++ t){
 
             // 特判跳过条件
@@ -206,6 +211,7 @@ __global__ void flashAttention_kernel(const T* h_q,
             // online softmax 优化朴素softmax算法，核心是将softmax的多个流程优化为一个流程，边计算边更改
 
             // 维护 online softmax 所需变量
+            #pragma unroll
             for(int d = 0; d < head_dim; ++d)
               now_sum += (float)q[d] * (float)k[t][d];
             now_sum *= scale;
@@ -220,12 +226,13 @@ __global__ void flashAttention_kernel(const T* h_q,
             sum = sum * change + add;
 
             // 公式2: O_new = O_old * change + V_curr * add
+            #pragma unroll
             for(int d = 0; d < head_dim; ++ d){
               arr[d] = arr[d] * change + v[t][d] * add;
             }
           }
-          }
-          __syncthreads();
+        }
+        __syncthreads();
       }
       if (valid_q) {
         // 防止除以 0
