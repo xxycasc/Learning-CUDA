@@ -118,7 +118,7 @@ __global__ void flashAttention_kernel(const T* h_q,
         }
       }
       const int tile_count = 16;
-      __shared__ float k[tile_count][260];
+      __shared__ float k[tile_count][260];// 开260解决bank_conflict 问题
       __shared__ float v[tile_count][260];
 
       for(int i = 0; i < src_seq_len; i += tile_count){
