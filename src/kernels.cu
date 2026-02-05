@@ -120,25 +120,76 @@ __global__ void flashAttention_kernel(const T* h_q,
       __shared__ float v[tile_count][260];
 
       for(int i = 0; i < src_seq_len; i += tile_count){
-        for(int j = tid; j < tile_count * head_dim; j += blockDim.x){
-          int row = j / head_dim;
-          int col = j % head_dim;
-          int kv_idx = i + row;
+        bool use_vectorization = std::is_same<T, float>::value && (head_dim % 4 == 0);
+        // 当数据类型为float时引入向量化搬运
+        if(use_vectorization){
+          // 强转指针
+          const float4* k_ptr = reinterpret_cast<const float4 *>(h_k);
+          const float4* v_ptr = reinterpret_cast<const float4 *>(h_v);
+          // 一次搬四个，要除4
+          int vec_dim = head_dim / 4;
           
-          size_t kv_base = ((size_t)batch_idx * src_seq_len * kv_heads + 
-                                  (size_t)kv_idx * kv_heads + kv_head_idx) * head_dim;
-          
-          if(kv_idx < src_seq_len){
-            k[row][col] = (float)h_k[kv_base + col];
-            v[row][col] = (float)h_v[kv_base + col];
-          }
-          // 内存开多了就初始化为0
-          else{
-            k[row][col] = 0.0f;
-            v[row][col] = 0.0f;
+          //其余逻辑与后面差不多，就是引入了向量化
+          for(int j = tid; j < tile_count * vec_dim; j += blockDim.x){
+            int row = j / vec_dim;
+            int col = j % vec_dim;
+            int kv_idx = i + row;
+
+            size_t kv_base = ((size_t)batch_idx * src_seq_len * kv_heads + 
+                                    (size_t)kv_idx * kv_heads + kv_head_idx) *  vec_dim ;
+            int col_base = col * 4;                        
+
+            if(kv_idx < src_seq_len){
+              // 读取数据
+              float4 k_val = k_ptr[kv_base + col];
+              float4 v_val = v_ptr[kv_base + col];
+              
+              // 拆包
+              k[row][col_base + 0] = k_val.x;
+              k[row][col_base + 1] = k_val.y;
+              k[row][col_base + 2] = k_val.z;
+              k[row][col_base + 3] = k_val.w;
+
+              v[row][col_base + 0] = v_val.x;
+              v[row][col_base + 1] = v_val.y;
+              v[row][col_base + 2] = v_val.z;
+              v[row][col_base + 3] = v_val.w;
+            }
+            // 内存开多了就初始化为0
+            else{
+              k[row][col_base + 0] = 0.0f;
+              k[row][col_base + 1] = 0.0f;
+              k[row][col_base + 2] = 0.0f;
+              k[row][col_base + 3] = 0.0f;
+
+              v[row][col_base + 0] = 0.0f;
+              v[row][col_base + 1] = 0.0f;
+              v[row][col_base + 2] = 0.0f;
+              v[row][col_base + 3] = 0.0f;
+            }
           }
         }
-        
+        else{
+          for(int j = tid; j < tile_count * head_dim; j += blockDim.x){
+            int row = j / head_dim;
+            int col = j % head_dim;
+            int kv_idx = i + row;
+
+            size_t kv_base = ((size_t)batch_idx * src_seq_len * kv_heads + 
+                                    (size_t)kv_idx * kv_heads + kv_head_idx) * head_dim;
+            
+            if(kv_idx < src_seq_len){
+              k[row][col] = (float)h_k[kv_base + col];
+              v[row][col] = (float)h_v[kv_base + col];
+            }
+            // 内存开多了就初始化为0
+            else{
+              k[row][col] = 0.0f;
+              v[row][col] = 0.0f;
+            }
+          }
+            
+        }
         // 等所有人搬完数据再继续
         __syncthreads();
 
